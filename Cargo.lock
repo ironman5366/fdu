@@ -338,6 +338,7 @@ dependencies = [
  "humansize",
  "jwalk",
  "ratatui",
+ "rayon",
  "serde",
  "serde_json",
  "tokio",
