@@ -130,7 +130,7 @@ fn render_thread_bar(threads: usize, max_width: usize) -> String {
 fn render_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    if app.show_threads && app.scanning {
+    if app.show_threads && (app.scanning || app.active_deletion.is_some()) {
         // Split view: header + thread panel + file list + footer
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -311,13 +311,23 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     let visible_height = area.height as usize;
 
     let scanning = app.scanning;
+    // Check if we're viewing the directory where a deletion is happening
+    let deleting_index = if app.active_deletion.is_some() && app.breadcrumbs == app.delete_breadcrumbs {
+        Some(app.delete_child_index)
+    } else {
+        None
+    };
+
     let items: Vec<ListItem> = node
         .children
         .iter()
         .enumerate()
         .skip(app.scroll_offset)
         .take(visible_height)
-        .map(|(i, child)| render_entry(child, parent_size, app.show_bars, i == app.selected_index, scanning))
+        .map(|(i, child)| {
+            let is_deleting = deleting_index == Some(i);
+            render_entry(child, parent_size, app.show_bars, i == app.selected_index, scanning, is_deleting)
+        })
         .collect();
 
     let list = List::new(items);
@@ -330,15 +340,20 @@ fn render_entry(
     show_bars: bool,
     is_selected: bool,
     scanning: bool,
+    is_deleting: bool,
 ) -> ListItem<'static> {
     // Directory with no size and no children yet = hasn't been crawled
     let is_pending = scanning && node.is_dir && node.size == 0 && node.child_count == 0;
-    let size_str = if is_pending {
+    let size_str = if is_deleting {
+        format!("{:>10}", format_size(node.size, BINARY))
+    } else if is_pending {
         format!("{:>10}", "pending")
     } else {
         format!("{:>10}", format_size(node.size, BINARY))
     };
-    let name = if node.is_dir {
+    let name = if is_deleting {
+        format!("{}/ [deleting...]", node.name)
+    } else if node.is_dir {
         format!("{}/", node.name)
     } else {
         node.name.clone()
@@ -357,7 +372,9 @@ fn render_entry(
         String::new()
     };
 
-    let base_style = if is_selected {
+    let base_style = if is_deleting {
+        Style::default().fg(Color::DarkGray)
+    } else if is_selected {
         Style::default()
             .bg(Color::DarkGray)
             .fg(Color::White)
@@ -366,7 +383,9 @@ fn render_entry(
         Style::default()
     };
 
-    let name_style = if node.is_dir {
+    let name_style = if is_deleting {
+        base_style.fg(Color::DarkGray)
+    } else if node.is_dir {
         base_style.fg(Color::Blue).add_modifier(Modifier::BOLD)
     } else {
         base_style
@@ -484,6 +503,32 @@ fn render_thread_panel(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // Show deletion progress if active
+    if let Some(ref del) = app.active_deletion {
+        let progress = if del.original_size > 0 {
+            let pct = (del.bytes_deleted as f64 / del.original_size as f64 * 100.0).min(100.0);
+            format!(" {:.0}%", pct)
+        } else {
+            String::new()
+        };
+        let spans = vec![
+            Span::styled(" Deleting ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(&del.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(
+                    "  {} files  {} / {}{}",
+                    format_num(del.files_deleted),
+                    format_size(del.bytes_deleted, BINARY),
+                    format_size(del.original_size, BINARY),
+                    progress,
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
+
     let count = app.child_count();
     let node = app.current_node();
     let is_aggregated = node.map(|n| n.child_count > n.children.len()).unwrap_or(false);
@@ -516,7 +561,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    if app.scanning {
+    if app.scanning || app.active_deletion.is_some() {
         spans.push(Span::styled(
             " space:threads ",
             Style::default().fg(Color::Green),
@@ -599,6 +644,14 @@ fn render_help_overlay(frame: &mut Frame) {
 }
 
 fn render_delete_confirm(frame: &mut Frame, app: &App) {
+    if app.delete_is_dir {
+        render_delete_confirm_typed(frame, app);
+    } else {
+        render_delete_confirm_simple(frame, app);
+    }
+}
+
+fn render_delete_confirm_simple(frame: &mut Frame, app: &App) {
     let area = centered_rect(50, 20, frame.area());
     frame.render_widget(Clear, area);
 
@@ -613,10 +666,7 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
     let name = app
         .current_node()
         .and_then(|n| n.children.get(app.selected_index))
-        .map(|c| {
-            let suffix = if c.is_dir { "/" } else { "" };
-            format!("{}{} ({})", c.name, suffix, format_size(c.size, BINARY))
-        })
+        .map(|c| format!("{} ({})", c.name, format_size(c.size, BINARY)))
         .unwrap_or_default();
 
     let text = vec![
@@ -632,6 +682,63 @@ fn render_delete_confirm(frame: &mut Frame, app: &App) {
             Span::styled("y", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::styled(" to confirm, ", Style::default().fg(Color::DarkGray)),
             Span::styled("n/Esc", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" to cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn render_delete_confirm_typed(frame: &mut Frame, app: &App) {
+    let area = centered_rect(60, 30, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(" Delete Directory ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let size_str = app
+        .current_node()
+        .and_then(|n| n.children.get(app.selected_index))
+        .map(|c| format_size(c.size, BINARY))
+        .unwrap_or_default();
+
+    let matches = app.delete_input == app.delete_target_name;
+    let input_style = if matches {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    let cursor = if matches { "" } else { "█" };
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Delete directory ", Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("{}/", app.delete_target_name),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" ({})", size_str), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Type the directory name to confirm:", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::Red)),
+            Span::styled(&app.delete_input, input_style),
+            Span::styled(cursor, Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Esc", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::styled(" to cancel", Style::default().fg(Color::DarkGray)),
         ]),
     ];
@@ -663,7 +770,12 @@ fn truncate_path(path: &str, max_len: usize) -> String {
     if path.len() <= max_len {
         path.to_string()
     } else if max_len > 3 {
-        format!("...{}", &path[path.len() - (max_len - 3)..])
+        let mut start = path.len() - (max_len - 3);
+        // Advance to the next char boundary to avoid splitting a multi-byte char
+        while !path.is_char_boundary(start) && start < path.len() {
+            start += 1;
+        }
+        format!("...{}", &path[start..])
     } else {
         "...".to_string()
     }

@@ -1,5 +1,6 @@
 use crate::scanner::{ScanMessage, ThreadActivities};
 use crate::tree::{FileNode, FileTree};
+use humansize::{format_size, BINARY};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +32,14 @@ pub struct ScanProgress {
     pub dirs_queued: usize,
 }
 
+pub struct DeletionProgress {
+    pub name: String,
+    pub bytes_deleted: u64,
+    pub files_deleted: u64,
+    pub dirs_deleted: u64,
+    pub original_size: u64,
+}
+
 pub struct App {
     pub view: View,
     pub tree: Option<FileTree>,
@@ -46,6 +55,13 @@ pub struct App {
     pub show_threads: bool,
     pub thread_activities: Option<ThreadActivities>,
     pub expanding: bool,
+    // Deletion state
+    pub delete_input: String,
+    pub delete_target_name: String,
+    pub delete_is_dir: bool,
+    pub active_deletion: Option<DeletionProgress>,
+    pub delete_breadcrumbs: Vec<usize>,
+    pub delete_child_index: usize,
 }
 
 impl App {
@@ -65,6 +81,12 @@ impl App {
             show_threads: false,
             thread_activities: None,
             expanding: false,
+            delete_input: String::new(),
+            delete_target_name: String::new(),
+            delete_is_dir: false,
+            active_deletion: None,
+            delete_breadcrumbs: Vec::new(),
+            delete_child_index: 0,
         }
     }
 
@@ -284,6 +306,115 @@ impl App {
                 let count = self.child_count();
                 if count > 0 && self.selected_index >= count {
                     self.selected_index = count - 1;
+                }
+            }
+            ScanMessage::DeleteProgress {
+                bytes_deleted,
+                files_deleted,
+                dirs_deleted,
+                ..
+            } => {
+                if let Some(ref mut del) = self.active_deletion {
+                    let bytes_delta = bytes_deleted.saturating_sub(del.bytes_deleted);
+                    let files_delta = files_deleted.saturating_sub(del.files_deleted);
+                    let dirs_delta = dirs_deleted.saturating_sub(del.dirs_deleted);
+                    del.bytes_deleted = bytes_deleted;
+                    del.files_deleted = files_deleted;
+                    del.dirs_deleted = dirs_deleted;
+
+                    // Subtract size delta from tree
+                    if let Some(tree) = self.tree.as_mut() {
+                        tree.root.size = tree.root.size.saturating_sub(bytes_delta);
+                        tree.total_files = tree.total_files.saturating_sub(files_delta);
+                        tree.total_dirs = tree.total_dirs.saturating_sub(dirs_delta);
+                        for depth in 0..self.delete_breadcrumbs.len() {
+                            let node = {
+                                let mut n = &mut tree.root;
+                                for &idx in &self.delete_breadcrumbs[..=depth] {
+                                    n = &mut n.children[idx];
+                                }
+                                n
+                            };
+                            node.size = node.size.saturating_sub(bytes_delta);
+                        }
+                        // Update the deleting node itself
+                        let parent = if self.delete_breadcrumbs.is_empty() {
+                            &mut tree.root
+                        } else {
+                            let mut n = &mut tree.root;
+                            for &idx in &self.delete_breadcrumbs {
+                                n = &mut n.children[idx];
+                            }
+                            n
+                        };
+                        if let Some(child) = parent.children.get_mut(self.delete_child_index) {
+                            child.size = child.size.saturating_sub(bytes_delta);
+                        }
+                    }
+                }
+            }
+            ScanMessage::DeleteComplete {
+                bytes_deleted,
+                files_deleted,
+                dirs_deleted,
+                error,
+                ..
+            } => {
+                if let Some(del) = self.active_deletion.take() {
+                    if error.is_none() {
+                        // Apply any remaining delta not yet accounted for
+                        let remaining_bytes = bytes_deleted.saturating_sub(del.bytes_deleted);
+                        let remaining_files = files_deleted.saturating_sub(del.files_deleted);
+                        let remaining_dirs = dirs_deleted.saturating_sub(del.dirs_deleted);
+
+                        if let Some(tree) = self.tree.as_mut() {
+                            tree.root.size = tree.root.size.saturating_sub(remaining_bytes);
+                            tree.total_files = tree.total_files.saturating_sub(remaining_files);
+                            tree.total_dirs = tree.total_dirs.saturating_sub(remaining_dirs + 1); // +1 for the dir itself
+                            for depth in 0..self.delete_breadcrumbs.len() {
+                                let node = {
+                                    let mut n = &mut tree.root;
+                                    for &idx in &self.delete_breadcrumbs[..=depth] {
+                                        n = &mut n.children[idx];
+                                    }
+                                    n
+                                };
+                                node.size = node.size.saturating_sub(remaining_bytes);
+                            }
+
+                            // Remove the child node from tree
+                            let parent = if self.delete_breadcrumbs.is_empty() {
+                                &mut tree.root
+                            } else {
+                                let mut n = &mut tree.root;
+                                for &idx in &self.delete_breadcrumbs {
+                                    n = &mut n.children[idx];
+                                }
+                                n
+                            };
+                            if self.delete_child_index < parent.children.len() {
+                                parent.children.remove(self.delete_child_index);
+                                parent.child_count = parent.children.len();
+                            }
+                        }
+
+                        // Fix selected index if we're still viewing the same directory
+                        if self.breadcrumbs == self.delete_breadcrumbs {
+                            let count = self.child_count();
+                            if count == 0 {
+                                self.selected_index = 0;
+                            } else if self.selected_index >= count {
+                                self.selected_index = count - 1;
+                            }
+                        }
+                    } else {
+                        self.error_message = Some(format!(
+                            "Delete failed ({}del, {}): {}",
+                            format_size(bytes_deleted, BINARY),
+                            del.name,
+                            error.unwrap()
+                        ));
+                    }
                 }
             }
             ScanMessage::Error(msg) => {

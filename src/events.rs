@@ -59,7 +59,8 @@ impl EventHandler {
                                 match (&latest, &next) {
                                     // Coalesce same-type updates
                                     (ScanMessage::Progress { .. }, ScanMessage::Progress { .. }) |
-                                    (ScanMessage::Counting { .. }, ScanMessage::Counting { .. }) => {
+                                    (ScanMessage::Counting { .. }, ScanMessage::Counting { .. }) |
+                                    (ScanMessage::DeleteProgress { .. }, ScanMessage::DeleteProgress { .. }) => {
                                         latest = next;
                                     }
                                     // Counting superseded by Progress (Progress has tree + counters)

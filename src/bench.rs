@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-mod cache;
 mod cli;
 mod scanner;
 mod tree;
@@ -82,7 +81,9 @@ async fn main() {
                     last_progress = Instant::now();
                 }
             }
-            Some(scanner::ScanMessage::ExpandResult { .. }) => {}
+            Some(scanner::ScanMessage::ExpandResult { .. })
+            | Some(scanner::ScanMessage::DeleteProgress { .. })
+            | Some(scanner::ScanMessage::DeleteComplete { .. }) => {}
             Some(scanner::ScanMessage::Error(e)) => {
                 eprintln!("Error: {}", e);
                 break;
