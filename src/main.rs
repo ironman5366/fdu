@@ -55,6 +55,7 @@ async fn main() -> Result<()> {
             path: cli.path.clone(),
             same_filesystem: cli.same_filesystem,
             stat_threads,
+            queue_multiplier: cli.queue_multiplier.unwrap_or(32),
             thread_activities,
         };
         let _scan_handle = start_scan(scan_options, scan_tx);
@@ -74,8 +75,8 @@ async fn main() -> Result<()> {
             match event {
                 AppEvent::Key(key) => handle_key(&mut app, key, &expand_state),
                 AppEvent::Scan(msg) => app.handle_scan_message(msg),
-                AppEvent::Resize => {} // ratatui handles resize on next draw
-                AppEvent::Tick => {}         // just triggers a redraw
+                AppEvent::Resize => {}
+                AppEvent::Tick => {}
             }
         }
 

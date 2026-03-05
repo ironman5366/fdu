@@ -1,5 +1,4 @@
 use crate::tree::{FileNode, FileTree};
-use rayon::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -30,7 +29,6 @@ pub enum ScanMessage {
     },
     Complete(FileTree),
     Error(String),
-    /// Result of an expand_directory request (user pressed 'e')
     ExpandResult {
         breadcrumbs: Vec<usize>,
         children: Vec<FileNode>,
@@ -41,11 +39,10 @@ pub struct ScanOptions {
     pub path: PathBuf,
     pub same_filesystem: bool,
     pub stat_threads: usize,
+    pub queue_multiplier: usize,
     pub thread_activities: ThreadActivities,
 }
 
-/// Number of entries to collect before sending a batch to the stat pipeline.
-const STAT_BATCH_SIZE: usize = 8192;
 /// Max file children per directory in progress snapshots.
 const MAX_SNAPSHOT_FILES_PER_DIR: usize = 500;
 /// Minimum interval between full tree snapshots.
@@ -54,17 +51,10 @@ const SNAPSHOT_INTERVAL_MS: u128 = 500;
 const LARGE_DIR_FILE_THRESHOLD: usize = 10_000;
 /// Number of top files by size to keep for aggregated directories.
 const TOP_FILES_TO_KEEP: usize = 100;
+/// Entries to read from one directory before rotating to the next.
+const READDIR_CHUNK_SIZE: usize = 1024;
 
-/// A batch of entries sent from the readdir stage to the stat stage.
-struct Batch {
-    entries: Vec<PendingEntry>,
-    files_count: u64,
-    dirs_count: u64,
-    dirs_queued: usize,
-    current_path: String,
-}
-
-/// Entry collected from readdir (no stat yet).
+/// Entry sent from readdir → stat workers.
 struct PendingEntry {
     path: PathBuf,
     parent: PathBuf,
@@ -72,17 +62,18 @@ struct PendingEntry {
     is_dir: bool,
 }
 
-/// Result of a parallel stat call.
-struct StatResult {
+/// Result sent from stat workers → tree builder.
+struct StatEntry {
+    parent: PathBuf,
+    name: String,
+    is_dir: bool,
     size: u64,
     mtime: Option<SystemTime>,
 }
 
 /// Tracks aggregated files for directories exceeding LARGE_DIR_FILE_THRESHOLD.
-/// Keeps the top N files by size so the UI shows the most important ones.
 struct DirAggregation {
     total_file_count: usize,
-    /// Top files by size (sorted descending, max TOP_FILES_TO_KEEP entries).
     top_files: Vec<FileNode>,
 }
 
@@ -94,7 +85,6 @@ impl DirAggregation {
         }
     }
 
-    /// Offer a file for inclusion in the top-N. Only keeps the largest.
     fn offer(&mut self, node: FileNode) {
         self.total_file_count += 1;
         let pos = self.top_files.partition_point(|f| f.size > node.size);
@@ -141,6 +131,7 @@ pub fn expand_directory(path: &Path, stat_threads: usize) -> Vec<FileNode> {
         .build()
         .unwrap();
 
+    use rayon::prelude::*;
     let mut children: Vec<FileNode> = pool.install(|| {
         pending
             .par_iter()
@@ -189,73 +180,77 @@ async fn run_scan_pipeline(
 
     let stat_threads = options.stat_threads;
     let thread_activities = options.thread_activities;
+    let queue_cap = stat_threads * options.queue_multiplier;
 
-    let (batch_tx, batch_rx) = std::sync::mpsc::sync_channel::<Batch>(2);
+    // Stage 1 → Stage 2: entries from readdir to stat workers
+    let (entry_tx, entry_rx) = async_channel::bounded::<PendingEntry>(queue_cap);
+    // Stage 2 → Stage 3: stat results to tree builder
+    let (result_tx, result_rx) = async_channel::bounded::<StatEntry>(queue_cap);
 
+    // === Stage 1: Readdir producer ===
     let readdir_root = root_path.clone();
     let readdir_handle = tokio::task::spawn_blocking(move || {
-        readdir_producer(readdir_root, root_dev, batch_tx);
+        readdir_producer(readdir_root, root_dev, entry_tx);
     });
 
-    let stat_root = root_path.clone();
-    let stat_handle = tokio::task::spawn_blocking(move || {
-        stat_consumer(
-            stat_root,
-            root_dev,
-            stat_threads,
-            thread_activities,
-            batch_rx,
-            progress_tx,
-        );
+    // === Stage 2: Stat workers (N independent workers) ===
+    let mut worker_handles = Vec::with_capacity(stat_threads);
+    for worker_id in 0..stat_threads {
+        let rx = entry_rx.clone();
+        let tx = result_tx.clone();
+        let activities = thread_activities.clone();
+        #[allow(unused_variables)]
+        let root_dev = root_dev;
+
+        worker_handles.push(tokio::task::spawn_blocking(move || {
+            stat_worker(worker_id, rx, tx, activities, root_dev);
+        }));
+    }
+    // Drop our copies — workers own the channel ends now
+    drop(entry_rx);
+    drop(result_tx);
+
+    // === Stage 3: Tree builder ===
+    let builder_root = root_path.clone();
+    let builder_handle = tokio::task::spawn_blocking(move || {
+        tree_builder(builder_root, stat_threads, result_rx, progress_tx);
     });
 
+    // Wait for pipeline to drain
     let _ = readdir_handle.await;
-    let _ = stat_handle.await;
+    for h in worker_handles {
+        let _ = h.await;
+    }
+    let _ = builder_handle.await;
 }
 
-/// Number of entries to read from one directory before rotating to the next.
-/// Keeps all directories making progress simultaneously.
-const READDIR_CHUNK_SIZE: usize = 1024;
+// ─── Stage 1: Readdir Producer ───────────────────────────────────────────────
 
-/// Stage 1: Round-robin readdir across all directories.
-/// Instead of exhausting one directory before moving to the next, reads a
-/// chunk from each directory in rotation. This prevents billion-entry
-/// directories from blocking discovery of the rest of the tree.
 fn readdir_producer(
     root_path: PathBuf,
     #[allow(unused_variables)] root_dev: Option<u64>,
-    batch_tx: std::sync::mpsc::SyncSender<Batch>,
+    entry_tx: async_channel::Sender<PendingEntry>,
 ) {
     let mut dirs_to_scan: VecDeque<PathBuf> = VecDeque::new();
     dirs_to_scan.push_back(root_path.clone());
 
-    // Active ReadDir iterators being round-robined
     let mut active_readers: VecDeque<(PathBuf, std::fs::ReadDir)> = VecDeque::new();
 
-    let mut pending: Vec<PendingEntry> = Vec::with_capacity(STAT_BATCH_SIZE);
-    let mut files_count: u64 = 0;
-    let mut dirs_count: u64 = 0;
-    let mut current_path_str = String::new();
-
     loop {
-        // Promote queued directories into active readers
-        while let Some(dir_path) = dirs_to_scan.pop_front() {
+        // Promote a few queued dirs into active readers
+        while active_readers.len() < 16 {
+            let dir_path = match dirs_to_scan.pop_front() {
+                Some(d) => d,
+                None => break,
+            };
+
             #[cfg(unix)]
-            {
-                #[allow(unused_variables)]
-                let skip = if let Some(rd) = root_dev {
-                    use std::os::unix::fs::MetadataExt;
-                    match std::fs::metadata(&dir_path) {
-                        Ok(m) if m.dev() != rd => true,
-                        Err(_) => true,
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
-                #[cfg(unix)]
-                if skip {
-                    continue;
+            if let Some(rd) = root_dev {
+                use std::os::unix::fs::MetadataExt;
+                match std::fs::metadata(&dir_path) {
+                    Ok(m) if m.dev() != rd => continue,
+                    Err(_) => continue,
+                    _ => {}
                 }
             }
 
@@ -269,23 +264,19 @@ fn readdir_producer(
             break;
         }
 
-        // Round-robin: read READDIR_CHUNK_SIZE entries from the front reader
+        // Round-robin: read a chunk from the front reader
         let (dir_path, mut reader) = active_readers.pop_front().unwrap();
         let mut chunk_count = 0;
         let mut exhausted = false;
 
         loop {
-            let entry_result = match reader.next() {
-                Some(r) => r,
+            let entry = match reader.next() {
+                Some(Ok(e)) => e,
+                Some(Err(_)) => continue,
                 None => {
                     exhausted = true;
                     break;
                 }
-            };
-
-            let entry = match entry_result {
-                Ok(e) => e,
-                Err(_) => continue,
             };
 
             let file_type = match entry.file_type() {
@@ -302,40 +293,20 @@ fn readdir_producer(
             let is_dir = file_type.is_dir();
 
             if is_dir {
-                dirs_count += 1;
                 dirs_to_scan.push_back(path.clone());
-            } else {
-                files_count += 1;
             }
 
-            pending.push(PendingEntry {
-                path,
-                parent: dir_path.clone(),
-                name,
-                is_dir,
-            });
-
-            if (files_count + dirs_count) % 500 == 0 {
-                current_path_str = pending
-                    .last()
-                    .map(|e| e.path.to_string_lossy().to_string())
-                    .unwrap_or_default();
-            }
-
-            if pending.len() >= STAT_BATCH_SIZE {
-                let batch = Batch {
-                    entries: std::mem::replace(
-                        &mut pending,
-                        Vec::with_capacity(STAT_BATCH_SIZE),
-                    ),
-                    files_count,
-                    dirs_count,
-                    dirs_queued: dirs_to_scan.len() + active_readers.len(),
-                    current_path: current_path_str.clone(),
-                };
-                if batch_tx.send(batch).is_err() {
-                    return;
-                }
+            // This blocks when the queue is full — natural backpressure
+            if entry_tx
+                .send_blocking(PendingEntry {
+                    path,
+                    parent: dir_path.clone(),
+                    name,
+                    is_dir,
+                })
+                .is_err()
+            {
+                return; // channel closed
             }
 
             chunk_count += 1;
@@ -345,45 +316,84 @@ fn readdir_producer(
         }
 
         if !exhausted {
-            // This directory has more entries — put it back for next round
             active_readers.push_back((dir_path, reader));
         }
     }
+    // entry_tx drops here → channel closes → workers exit
+}
 
-    if !pending.is_empty() {
-        let batch = Batch {
-            entries: pending,
-            files_count,
-            dirs_count,
-            dirs_queued: 0,
-            current_path: current_path_str,
+// ─── Stage 2: Stat Workers ──────────────────────────────────────────────────
+
+fn stat_worker(
+    worker_id: usize,
+    entry_rx: async_channel::Receiver<PendingEntry>,
+    result_tx: async_channel::Sender<StatEntry>,
+    activities: ThreadActivities,
+    #[allow(unused_variables)] root_dev: Option<u64>,
+) {
+    while let Ok(entry) = entry_rx.recv_blocking() {
+        // Update thread activity slot
+        if let Some(slot) = activities.get(worker_id) {
+            if let Ok(mut s) = slot.try_lock() {
+                *s = entry.path.to_string_lossy().to_string();
+            }
+        }
+
+        let meta = match std::fs::symlink_metadata(&entry.path) {
+            Ok(m) => m,
+            Err(_) => continue, // skip errors
         };
-        let _ = batch_tx.send(batch);
+
+        #[cfg(unix)]
+        if let Some(rd) = root_dev {
+            use std::os::unix::fs::MetadataExt;
+            if meta.dev() != rd {
+                continue;
+            }
+        }
+
+        let size = if entry.is_dir { 0 } else { meta.len() };
+        let mtime = meta.modified().ok();
+
+        if result_tx
+            .send_blocking(StatEntry {
+                parent: entry.parent,
+                name: entry.name,
+                is_dir: entry.is_dir,
+                size,
+                mtime,
+            })
+            .is_err()
+        {
+            return; // channel closed
+        }
+    }
+
+    // Clear our activity slot
+    if let Some(slot) = activities.get(worker_id) {
+        if let Ok(mut s) = slot.try_lock() {
+            s.clear();
+        }
     }
 }
 
-/// Stage 2: Receives batches, does parallel stat, updates tree, sends progress.
-fn stat_consumer(
+// ─── Stage 3: Tree Builder ──────────────────────────────────────────────────
+
+fn tree_builder(
     root_path: PathBuf,
-    #[allow(unused_variables)] root_dev: Option<u64>,
     stat_threads: usize,
-    thread_activities: ThreadActivities,
-    batch_rx: std::sync::mpsc::Receiver<Batch>,
+    result_rx: async_channel::Receiver<StatEntry>,
     progress_tx: mpsc::UnboundedSender<ScanMessage>,
 ) {
-    let stat_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(stat_threads)
-        .build()
-        .unwrap();
-
     let mut dir_children: HashMap<PathBuf, Vec<FileNode>> = HashMap::new();
     let mut dir_mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::new();
     let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
-    let mut errors_count: u64 = 0;
-
-    // Aggregation tracking
     let mut dir_file_counts: HashMap<PathBuf, usize> = HashMap::new();
     let mut aggregated_dirs: HashMap<PathBuf, DirAggregation> = HashMap::new();
+
+    let mut files_count: u64 = 0;
+    let mut dirs_count: u64 = 0;
+    let mut errors_count: u64 = 0;
 
     let root_mtime = std::fs::metadata(&root_path)
         .ok()
@@ -393,110 +403,65 @@ fn stat_consumer(
 
     let scan_start = Instant::now();
     let mut last_snapshot_time = Instant::now();
-    let mut last_files_count: u64 = 0;
-    let mut last_dirs_count: u64 = 0;
+    let mut current_path = String::new();
+    let mut entry_count: u64 = 0;
 
-    while let Ok(batch) = batch_rx.recv() {
-        last_files_count = batch.files_count;
-        last_dirs_count = batch.dirs_count;
+    while let Ok(entry) = result_rx.recv_blocking() {
+        if entry.is_dir {
+            dirs_count += 1;
+            dir_children.entry(PathBuf::from(&entry.parent).join(&entry.name)).or_default();
+            dir_mtimes.insert(
+                entry.parent.join(&entry.name),
+                entry.mtime,
+            );
+            dir_children
+                .entry(entry.parent.clone())
+                .or_default()
+                .push(FileNode::new_dir(entry.name.clone(), entry.mtime));
+        } else {
+            files_count += 1;
 
-        for entry in &batch.entries {
-            if entry.is_dir {
-                dir_children.entry(entry.path.clone()).or_default();
-            }
-        }
+            let file_count = dir_file_counts.entry(entry.parent.clone()).or_insert(0);
+            let node = FileNode::new_file(entry.name.clone(), entry.size, entry.mtime);
 
-        // Parallel stat
-        let activities = thread_activities.clone();
-        let stat_results: Vec<Option<StatResult>> = stat_pool.install(|| {
-            batch
-                .entries
-                .par_iter()
-                .map(|entry| {
-                    if let Some(idx) = rayon::current_thread_index() {
-                        if let Some(slot) = activities.get(idx) {
-                            if let Ok(mut s) = slot.try_lock() {
-                                *s = entry.path.to_string_lossy().to_string();
-                            }
-                        }
-                    }
-
-                    let meta = std::fs::symlink_metadata(&entry.path).ok()?;
-
-                    #[cfg(unix)]
-                    if let Some(rd) = root_dev {
-                        use std::os::unix::fs::MetadataExt;
-                        if meta.dev() != rd {
-                            return None;
-                        }
-                    }
-
-                    let size = if entry.is_dir { 0 } else { meta.len() };
-                    let mtime = meta.modified().ok();
-                    Some(StatResult { size, mtime })
-                })
-                .collect()
-        });
-
-        // Process results sequentially
-        for (entry, stat) in batch.entries.iter().zip(stat_results.iter()) {
-            let (size, mtime) = match stat {
-                Some(s) => (s.size, s.mtime),
-                None => {
-                    errors_count += 1;
-                    continue;
-                }
-            };
-
-            if entry.is_dir {
-                dir_children.entry(entry.path.clone()).or_default();
-                dir_mtimes.insert(entry.path.clone(), mtime);
+            if *file_count < LARGE_DIR_FILE_THRESHOLD {
                 dir_children
                     .entry(entry.parent.clone())
                     .or_default()
-                    .push(FileNode::new_dir(entry.name.clone(), mtime));
+                    .push(node);
+                *file_count += 1;
             } else {
-                let file_count = dir_file_counts.entry(entry.parent.clone()).or_insert(0);
-                let node = FileNode::new_file(entry.name.clone(), size, mtime);
+                let agg = aggregated_dirs
+                    .entry(entry.parent.clone())
+                    .or_insert_with(|| DirAggregation::new(*file_count));
+                agg.offer(node);
+            }
 
-                if *file_count < LARGE_DIR_FILE_THRESHOLD {
-                    // Under threshold: store normally
-                    dir_children
-                        .entry(entry.parent.clone())
-                        .or_default()
-                        .push(node);
-                    *file_count += 1;
-                } else {
-                    // Over threshold: aggregate — only keep top N by size
-                    let agg = aggregated_dirs
-                        .entry(entry.parent.clone())
-                        .or_insert_with(|| DirAggregation::new(*file_count));
-                    agg.offer(node);
+            // Propagate size to ancestors
+            let mut ancestor = entry.parent.clone();
+            loop {
+                *dir_sizes.entry(ancestor.clone()).or_insert(0) += entry.size;
+                if ancestor == root_path {
+                    break;
                 }
-
-                // Size propagation always runs
-                let mut ancestor = entry.parent.clone();
-                loop {
-                    *dir_sizes.entry(ancestor.clone()).or_insert(0) += size;
-                    if ancestor == root_path {
-                        break;
-                    }
-                    match ancestor.parent() {
-                        Some(p) => ancestor = p.to_path_buf(),
-                        None => break,
-                    }
+                match ancestor.parent() {
+                    Some(p) => ancestor = p.to_path_buf(),
+                    None => break,
                 }
             }
         }
 
-        // Send progress (rate-limited snapshots).
-        // Skip building if we're still within the interval — building the
-        // recursive snapshot is O(directories) and must not stall the pipeline.
+        entry_count += 1;
+        if entry_count % 500 == 0 {
+            current_path = format!("{}/{}", entry.parent.display(), entry.name);
+        }
+
+        // Rate-limited snapshots
         let now = Instant::now();
         if now.duration_since(last_snapshot_time).as_millis() >= SNAPSHOT_INTERVAL_MS {
             last_snapshot_time = now;
             let elapsed = scan_start.elapsed().as_secs_f64();
-            let total = batch.files_count + batch.dirs_count;
+            let total = files_count + dirs_count;
             let eps = if elapsed > 0.0 {
                 (total as f64 / elapsed) as u64
             } else {
@@ -509,29 +474,22 @@ fn stat_consumer(
                 &dir_sizes,
                 &aggregated_dirs,
                 &dir_file_counts,
-                batch.files_count,
-                batch.dirs_count,
+                files_count,
+                dirs_count,
                 errors_count,
             );
             let _ = progress_tx.send(ScanMessage::Progress {
                 tree: snapshot,
-                current_path: batch.current_path.clone(),
+                current_path: current_path.clone(),
                 elapsed_secs: elapsed,
                 entries_per_sec: eps,
                 stat_threads,
-                dirs_queued: batch.dirs_queued,
+                dirs_queued: 0, // not easily available from this stage
             });
         }
     }
 
-    // Clear thread activities
-    for slot in thread_activities.iter() {
-        if let Ok(mut s) = slot.try_lock() {
-            s.clear();
-        }
-    }
-
-    // Assemble the final tree
+    // Build final tree
     let root = assemble_tree(
         &root_path,
         &mut dir_children,
@@ -544,8 +502,8 @@ fn stat_consumer(
     let tree = FileTree {
         root_path: root_path.clone(),
         root,
-        total_files: last_files_count,
-        total_dirs: last_dirs_count,
+        total_files: files_count,
+        total_dirs: dirs_count,
         total_errors: errors_count,
         scan_time: SystemTime::now(),
         complete: true,
@@ -554,7 +512,8 @@ fn stat_consumer(
     let _ = progress_tx.send(ScanMessage::Complete(tree));
 }
 
-/// Build a recursive tree snapshot from the current scan state.
+// ─── Snapshot Building ──────────────────────────────────────────────────────
+
 #[allow(clippy::too_many_arguments)]
 fn build_snapshot(
     root_path: &Path,
@@ -587,7 +546,6 @@ fn build_snapshot(
     }
 }
 
-/// Recursively build a FileNode from the dir_children HashMap.
 fn build_snapshot_node(
     path: &Path,
     dir_children: &HashMap<PathBuf, Vec<FileNode>>,
@@ -606,15 +564,12 @@ fn build_snapshot_node(
 
     let total_size = dir_sizes.get(path).copied().unwrap_or(0);
 
-    // Compute accurate child count including aggregated files
     let total_child_count = if let Some(agg) = aggregated_dirs.get(path) {
         let dir_count = entries
             .map(|e| e.iter().filter(|c| c.is_dir).count())
             .unwrap_or(0);
         dir_count + agg.total_file_count
     } else {
-        // Use dir_file_counts if available (more accurate than entries.len()
-        // since entries might have files AND dirs mixed)
         let dir_count = entries
             .map(|e| e.iter().filter(|c| c.is_dir).count())
             .unwrap_or(0);
@@ -648,8 +603,6 @@ fn build_snapshot_node(
         }
     }
 
-    // For aggregated dirs, merge in top files from the heap
-    // (these are files beyond the 10K threshold that were the largest)
     if let Some(agg) = aggregated_dirs.get(path) {
         for top_file in &agg.top_files {
             children.push(top_file.clone());
@@ -669,13 +622,15 @@ fn build_snapshot_node(
     }
 }
 
+// ─── Final Tree Assembly ────────────────────────────────────────────────────
+
 fn assemble_tree(
     path: &Path,
     dir_children: &mut HashMap<PathBuf, Vec<FileNode>>,
     dir_mtimes: &HashMap<PathBuf, Option<SystemTime>>,
     dir_sizes: &HashMap<PathBuf, u64>,
     aggregated_dirs: &HashMap<PathBuf, DirAggregation>,
-    dir_file_counts: &HashMap<PathBuf, usize>,
+    _dir_file_counts: &HashMap<PathBuf, usize>,
 ) -> FileNode {
     let children = dir_children.remove(path).unwrap_or_default();
     let mtime = dir_mtimes.get(path).copied().flatten();
@@ -696,7 +651,7 @@ fn assemble_tree(
                 dir_mtimes,
                 dir_sizes,
                 aggregated_dirs,
-                dir_file_counts,
+                _dir_file_counts,
             );
             assembled_children.push(assembled);
         } else {
@@ -704,15 +659,12 @@ fn assemble_tree(
         }
     }
 
-    // Merge top files from aggregation heap (these are the globally largest
-    // files beyond the 10K threshold — not already in assembled_children)
     if let Some(agg) = aggregated_dirs.get(path) {
         for top_file in &agg.top_files {
             assembled_children.push(top_file.clone());
         }
     }
 
-    // For aggregated dirs, use dir_sizes (which includes ALL files, not just stored ones)
     let size = if aggregated_dirs.contains_key(path) {
         dir_sizes.get(path).copied().unwrap_or(0)
     } else {

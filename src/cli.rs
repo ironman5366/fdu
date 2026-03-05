@@ -23,4 +23,8 @@ pub struct Cli {
     /// Number of threads for parallel stat calls (default: 128)
     #[arg(short = 't', long = "threads", value_name = "N")]
     pub threads: Option<usize>,
+
+    /// Queue depth multiplier per thread (default: 32)
+    #[arg(short = 'm', long = "queue-multiplier", value_name = "N")]
+    pub queue_multiplier: Option<usize>,
 }
