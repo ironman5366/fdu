@@ -1,5 +1,5 @@
 use crate::tree::{FileNode, FileTree};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,13 +43,11 @@ pub enum ScanMessage {
         children: Vec<FileNode>,
     },
     DeleteProgress {
-        path: PathBuf,
         bytes_deleted: u64,
         files_deleted: u64,
         dirs_deleted: u64,
     },
     DeleteComplete {
-        path: PathBuf,
         bytes_deleted: u64,
         files_deleted: u64,
         dirs_deleted: u64,
@@ -383,7 +381,7 @@ fn tree_builder(
 
     let mut files_count: u64 = 0;
     let mut dirs_count: u64 = 0;
-    let mut errors_count: u64 = 0;
+    let errors_count: u64 = 0;
 
     let root_mtime = std::fs::metadata(&root_path)
         .ok()
@@ -749,7 +747,6 @@ pub fn delete_directory_async(
     }
 
     let _ = tx.send(ScanMessage::DeleteComplete {
-        path,
         bytes_deleted,
         files_deleted,
         dirs_deleted,
@@ -796,7 +793,6 @@ fn walk_delete(
         *counter += 1;
         if *counter % 100 == 0 {
             let _ = tx.send(ScanMessage::DeleteProgress {
-                path: root_path.to_path_buf(),
                 bytes_deleted: *bytes,
                 files_deleted: *files,
                 dirs_deleted: *dirs,

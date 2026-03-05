@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 /// Headless profiler — runs the same scan pipeline and handle_scan_message
 /// as the TUI but without rendering or crossterm. Logs slow frames to stdout.
 use std::path::PathBuf;
