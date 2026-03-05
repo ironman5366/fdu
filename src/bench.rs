@@ -19,6 +19,7 @@ async fn main() {
         path: path.clone(),
         same_filesystem: false,
         stat_threads: 128,
+        thread_activities: scanner::new_thread_activities(128),
     };
 
     let start = Instant::now();

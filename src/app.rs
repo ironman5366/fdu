@@ -1,4 +1,4 @@
-use crate::scanner::ScanMessage;
+use crate::scanner::{ScanMessage, ThreadActivities};
 use crate::tree::{FileNode, FileTree};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +42,8 @@ pub struct App {
     pub should_quit: bool,
     pub scroll_offset: usize,
     pub error_message: Option<String>,
+    pub show_threads: bool,
+    pub thread_activities: Option<ThreadActivities>,
 }
 
 impl App {
@@ -58,6 +60,8 @@ impl App {
             should_quit: false,
             scroll_offset: 0,
             error_message: None,
+            show_threads: false,
+            thread_activities: None,
         }
     }
 

@@ -129,22 +129,43 @@ fn render_thread_bar(threads: usize, max_width: usize) -> String {
 fn render_browser(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(1),   // list
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
+    if app.show_threads && app.scanning {
+        // Split view: header + thread panel + file list + footer
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),       // header
+                Constraint::Percentage(50),  // thread activity
+                Constraint::Min(1),          // file list
+                Constraint::Length(1),        // footer
+            ])
+            .split(area);
 
-    render_header(frame, app, chunks[0]);
+        render_header(frame, app, chunks[0]);
+        render_thread_panel(frame, app, chunks[1]);
 
-    let visible_height = chunks[1].height as usize;
-    app.ensure_visible_with_height(visible_height);
+        let visible_height = chunks[2].height as usize;
+        app.ensure_visible_with_height(visible_height);
+        render_list(frame, app, chunks[2]);
+        render_footer(frame, app, chunks[3]);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // header
+                Constraint::Min(1),   // list
+                Constraint::Length(1), // footer
+            ])
+            .split(area);
 
-    render_list(frame, app, chunks[1]);
-    render_footer(frame, app, chunks[2]);
+        render_header(frame, app, chunks[0]);
+
+        let visible_height = chunks[1].height as usize;
+        app.ensure_visible_with_height(visible_height);
+
+        render_list(frame, app, chunks[1]);
+        render_footer(frame, app, chunks[2]);
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -309,6 +330,89 @@ fn render_entry(
     ListItem::new(Line::from(spans))
 }
 
+fn render_thread_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let activities = match &app.thread_activities {
+        Some(a) => a,
+        None => return,
+    };
+
+    let num_threads = activities.len();
+
+    // Read all thread slots
+    let mut threads: Vec<(usize, String)> = Vec::new();
+    let mut active_count = 0;
+    for (i, slot) in activities.iter().enumerate() {
+        if let Ok(s) = slot.try_lock() {
+            if !s.is_empty() {
+                active_count += 1;
+                threads.push((i, s.clone()));
+            }
+        }
+    }
+
+    let block = Block::default()
+        .title(format!(
+            " Thread Activity — {}/{} active (space to hide) ",
+            active_count, num_threads
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    let bar_width = inner.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Utilization bar: filled portion = active threads
+    if bar_width > 0 {
+        let filled = ((active_count as f64 / num_threads as f64) * bar_width as f64).round() as usize;
+        let empty = bar_width.saturating_sub(filled);
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
+            Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    // Individual thread rows (only active threads, sorted by index)
+    let max_rows = inner.height.saturating_sub(lines.len() as u16) as usize;
+    let path_max = inner.width.saturating_sub(12) as usize;
+
+    for (i, path) in threads.iter().take(max_rows) {
+        let short = truncate_path(path, path_max);
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:>3} ", i), Style::default().fg(Color::DarkGray)),
+            Span::styled("▮ ", Style::default().fg(Color::Green)),
+            Span::styled(short, Style::default().fg(Color::White)),
+        ]));
+    }
+
+    let remaining = threads.len().saturating_sub(max_rows);
+    if remaining > 0 {
+        if let Some(last) = lines.last_mut() {
+            *last = Line::from(Span::styled(
+                format!("      ... and {} more active threads", remaining),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    if threads.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  All threads idle (between stat batches)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let count = app.child_count();
     let pos = if count > 0 {
@@ -317,16 +421,21 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         "empty".to_string()
     };
 
-    let footer = Line::from(vec![
-        Span::styled(
-            " ↑↓/jk:nav  →/enter:open  ←/bs:back  s:sort  g:bars  d:del  ?:help  q:quit ",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!(" {} ", pos),
-            Style::default().fg(Color::Yellow),
-        ),
-    ]);
+    let mut spans = vec![Span::styled(
+        " ↑↓/jk:nav  →/enter:open  ←/bs:back  s:sort  g:bars  d:del  ?:help  q:quit ",
+        Style::default().fg(Color::DarkGray),
+    )];
+    if app.scanning {
+        spans.push(Span::styled(
+            " space:threads ",
+            Style::default().fg(Color::Green),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(" {} ", pos),
+        Style::default().fg(Color::Yellow),
+    ));
+    let footer = Line::from(spans);
 
     frame.render_widget(Paragraph::new(footer), area);
 }

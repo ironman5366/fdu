@@ -12,7 +12,7 @@ use clap::Parser;
 use cli::Cli;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use events::{AppEvent, EventHandler};
-use scanner::{ScanOptions, start_scan};
+use scanner::{ScanOptions, new_thread_activities, start_scan};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -37,10 +37,14 @@ async fn main() -> Result<()> {
         app.view = app::View::Browser;
     } else {
         // Start background scan
+        let stat_threads = cli.threads.unwrap_or(128);
+        let thread_activities = new_thread_activities(stat_threads);
+        app.thread_activities = Some(thread_activities.clone());
         let scan_options = ScanOptions {
             path: cli.path.clone(),
             same_filesystem: cli.same_filesystem,
-            stat_threads: cli.threads.unwrap_or(128),
+            stat_threads,
+            thread_activities,
         };
         let _scan_handle = start_scan(scan_options, scan_tx);
     }
@@ -124,6 +128,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char('d') => {
                 if app.child_count() > 0 {
                     app.view = app::View::DeleteConfirm;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if app.scanning {
+                    app.show_threads = !app.show_threads;
                 }
             }
             KeyCode::Char('?') => app.view = app::View::Help,
