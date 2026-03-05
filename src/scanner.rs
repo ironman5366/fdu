@@ -27,6 +27,14 @@ pub enum ScanMessage {
         stat_threads: usize,
         dirs_queued: usize,
     },
+    /// Lightweight counter update (no tree clone — just numbers for the status bar)
+    Counting {
+        files_count: u64,
+        dirs_count: u64,
+        current_path: String,
+        elapsed_secs: f64,
+        entries_per_sec: u64,
+    },
     Complete(FileTree),
     Error(String),
     ExpandResult {
@@ -452,11 +460,27 @@ fn tree_builder(
         }
 
         entry_count += 1;
-        if entry_count % 500 == 0 {
+        if entry_count % 200 == 0 {
             current_path = format!("{}/{}", entry.parent.display(), entry.name);
+
+            // Send lightweight counter update frequently (no tree clone)
+            let elapsed = scan_start.elapsed().as_secs_f64();
+            let total = files_count + dirs_count;
+            let eps = if elapsed > 0.0 {
+                (total as f64 / elapsed) as u64
+            } else {
+                0
+            };
+            let _ = progress_tx.send(ScanMessage::Counting {
+                files_count,
+                dirs_count,
+                current_path: current_path.clone(),
+                elapsed_secs: elapsed,
+                entries_per_sec: eps,
+            });
         }
 
-        // Rate-limited snapshots
+        // Rate-limited full tree snapshots (expensive)
         let now = Instant::now();
         if now.duration_since(last_snapshot_time).as_millis() >= SNAPSHOT_INTERVAL_MS {
             last_snapshot_time = now;

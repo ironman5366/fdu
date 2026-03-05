@@ -57,12 +57,21 @@ impl EventHandler {
                             let mut latest = msg;
                             while let Ok(next) = scan_rx.try_recv() {
                                 match (&latest, &next) {
-                                    // Replace Progress with newer Progress
-                                    (ScanMessage::Progress { .. }, ScanMessage::Progress { .. }) => {
+                                    // Coalesce same-type updates
+                                    (ScanMessage::Progress { .. }, ScanMessage::Progress { .. }) |
+                                    (ScanMessage::Counting { .. }, ScanMessage::Counting { .. }) => {
                                         latest = next;
                                     }
-                                    // Non-Progress messages (Complete, Error, ExpandResult)
-                                    // must be delivered — send the current one, keep the new
+                                    // Counting superseded by Progress (Progress has tree + counters)
+                                    (ScanMessage::Counting { .. }, ScanMessage::Progress { .. }) => {
+                                        latest = next;
+                                    }
+                                    // Progress followed by Counting — send Progress, keep Counting
+                                    // (or just drop counting since progress is more complete)
+                                    (ScanMessage::Progress { .. }, ScanMessage::Counting { .. }) => {
+                                        // Drop the counting, keep the richer Progress
+                                    }
+                                    // Non-update messages must be delivered
                                     _ => {
                                         let _ = tx.send(AppEvent::Scan(latest));
                                         latest = next;

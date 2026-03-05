@@ -63,6 +63,25 @@ async fn main() {
                 );
                 break;
             }
+            Some(scanner::ScanMessage::Counting {
+                files_count,
+                dirs_count,
+                entries_per_sec,
+                current_path,
+                ..
+            }) => {
+                if last_progress.elapsed().as_millis() > 200 {
+                    eprintln!(
+                        "[{:.1}s] {} files, {} dirs | {}/s | {}",
+                        start.elapsed().as_secs_f64(),
+                        files_count,
+                        dirs_count,
+                        entries_per_sec,
+                        current_path,
+                    );
+                    last_progress = Instant::now();
+                }
+            }
             Some(scanner::ScanMessage::ExpandResult { .. }) => {}
             Some(scanner::ScanMessage::Error(e)) => {
                 eprintln!("Error: {}", e);

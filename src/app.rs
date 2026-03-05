@@ -237,6 +237,23 @@ impl App {
                     self.selected_index = count - 1;
                 }
             }
+            ScanMessage::Counting {
+                files_count,
+                dirs_count,
+                current_path,
+                elapsed_secs,
+                entries_per_sec,
+            } => {
+                self.scan_progress.files_count = files_count;
+                self.scan_progress.dirs_count = dirs_count;
+                self.scan_progress.current_path = current_path;
+                self.scan_progress.elapsed_secs = elapsed_secs;
+                self.scan_progress.entries_per_sec = entries_per_sec;
+                // Switch from Scanning screen to Browser as soon as we have any data
+                if self.view == View::Scanning && self.tree.is_some() {
+                    self.view = View::Browser;
+                }
+            }
             ScanMessage::Complete(tree) => {
                 self.tree = Some(tree);
                 self.scanning = false;
