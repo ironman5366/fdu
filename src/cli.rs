@@ -19,4 +19,8 @@ pub struct Cli {
     /// Stay on the same filesystem (do not cross mount points)
     #[arg(short = 'x', long = "one-file-system")]
     pub same_filesystem: bool,
+
+    /// Number of threads for parallel stat calls (default: 128)
+    #[arg(short = 't', long = "threads", value_name = "N")]
+    pub threads: Option<usize>,
 }

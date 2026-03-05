@@ -24,6 +24,10 @@ pub struct ScanProgress {
     pub total_size: u64,
     pub errors_count: u64,
     pub current_path: String,
+    pub elapsed_secs: f64,
+    pub entries_per_sec: u64,
+    pub stat_threads: usize,
+    pub dirs_queued: usize,
 }
 
 pub struct App {
@@ -187,13 +191,24 @@ impl App {
 
     pub fn handle_scan_message(&mut self, msg: ScanMessage) {
         match msg {
-            ScanMessage::Progress { tree, current_path } => {
+            ScanMessage::Progress {
+                tree,
+                current_path,
+                elapsed_secs,
+                entries_per_sec,
+                stat_threads,
+                dirs_queued,
+            } => {
                 self.scan_progress = ScanProgress {
                     files_count: tree.total_files,
                     dirs_count: tree.total_dirs,
                     total_size: tree.root.size,
                     errors_count: tree.total_errors,
                     current_path,
+                    elapsed_secs,
+                    entries_per_sec,
+                    stat_threads,
+                    dirs_queued,
                 };
                 self.tree = Some(tree);
                 if self.view == View::Scanning {

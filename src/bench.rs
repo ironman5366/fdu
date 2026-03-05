@@ -18,6 +18,7 @@ async fn main() {
     let options = scanner::ScanOptions {
         path: path.clone(),
         same_filesystem: false,
+        stat_threads: 128,
     };
 
     let start = Instant::now();
@@ -26,14 +27,20 @@ async fn main() {
     let mut last_progress = Instant::now();
     loop {
         match rx.recv().await {
-            Some(scanner::ScanMessage::Progress { tree, current_path }) => {
+            Some(scanner::ScanMessage::Progress {
+                tree,
+                current_path,
+                entries_per_sec,
+                ..
+            }) => {
                 if last_progress.elapsed().as_millis() > 200 {
                     eprintln!(
-                        "[{:.1}s] {} files, {} dirs, {} errors | {}",
+                        "[{:.1}s] {} files, {} dirs, {} errors | {}/s | {}",
                         start.elapsed().as_secs_f64(),
                         tree.total_files,
                         tree.total_dirs,
                         tree.total_errors,
+                        entries_per_sec,
                         current_path,
                     );
                     last_progress = Instant::now();

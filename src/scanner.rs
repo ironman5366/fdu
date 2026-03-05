@@ -10,6 +10,10 @@ pub enum ScanMessage {
     Progress {
         tree: FileTree,
         current_path: String,
+        elapsed_secs: f64,
+        entries_per_sec: u64,
+        stat_threads: usize,
+        dirs_queued: usize,
     },
     Complete(FileTree),
     Error(String),
@@ -18,12 +22,11 @@ pub enum ScanMessage {
 pub struct ScanOptions {
     pub path: PathBuf,
     pub same_filesystem: bool,
+    pub stat_threads: usize,
 }
 
 /// Number of entries to collect before doing a parallel stat batch.
 const STAT_BATCH_SIZE: usize = 8192;
-/// Number of threads for parallel stat calls.
-const STAT_THREADS: usize = 128;
 /// How often to send progress updates (in entries from readdir).
 const PROGRESS_INTERVAL: u64 = 2000;
 /// Max file children per directory in progress snapshots (dirs always included).
@@ -94,10 +97,13 @@ fn scan_directory(options: &ScanOptions, tx: &mpsc::UnboundedSender<ScanMessage>
     dir_children.insert(root_path.clone(), Vec::new());
     dir_mtimes.insert(root_path.clone(), root_mtime);
 
+    let stat_threads = options.stat_threads;
     let stat_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(STAT_THREADS)
+        .num_threads(stat_threads)
         .build()
         .unwrap();
+
+    let scan_start = Instant::now();
 
     // BFS queue — use streaming read_dir instead of jwalk so entries flow
     // immediately from the OS rather than being buffered per-directory.
@@ -206,6 +212,13 @@ fn scan_directory(options: &ScanOptions, tx: &mpsc::UnboundedSender<ScanMessage>
                 let now = Instant::now();
                 if now.duration_since(last_snapshot_time).as_millis() >= SNAPSHOT_INTERVAL_MS {
                     last_snapshot_time = now;
+                    let elapsed = scan_start.elapsed().as_secs_f64();
+                    let total = files_count + dirs_count;
+                    let eps = if elapsed > 0.0 {
+                        (total as f64 / elapsed) as u64
+                    } else {
+                        0
+                    };
                     let snapshot = build_snapshot(
                         &root_path,
                         &dir_children,
@@ -218,6 +231,10 @@ fn scan_directory(options: &ScanOptions, tx: &mpsc::UnboundedSender<ScanMessage>
                     let _ = tx.send(ScanMessage::Progress {
                         tree: snapshot,
                         current_path: current_path_str.clone(),
+                        elapsed_secs: elapsed,
+                        entries_per_sec: eps,
+                        stat_threads,
+                        dirs_queued: dirs_to_scan.len(),
                     });
                 }
             }

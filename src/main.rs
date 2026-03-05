@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         let scan_options = ScanOptions {
             path: cli.path.clone(),
             same_filesystem: cli.same_filesystem,
+            stat_threads: cli.threads.unwrap_or(128),
         };
         let _scan_handle = start_scan(scan_options, scan_tx);
     }

@@ -45,29 +45,63 @@ fn render_scanning(frame: &mut Frame, app: &App) {
     frame.render_widget(block, area);
 
     let progress = &app.scan_progress;
+
+    // Animated spinner
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner_idx = (progress.elapsed_secs * 10.0) as usize % spinner_chars.len();
+    let spinner = spinner_chars[spinner_idx];
+
+    // Thread activity visualization: show stat threads as a mini bar
+    let thread_bar = render_thread_bar(progress.stat_threads, inner.width.saturating_sub(22) as usize);
+
+    let elapsed_str = format_elapsed(progress.elapsed_secs);
+
     let text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Files:       ", Style::default().fg(Color::Yellow)),
-            Span::raw(format_num(progress.files_count)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Directories: ", Style::default().fg(Color::Yellow)),
-            Span::raw(format_num(progress.dirs_count)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Total size:  ", Style::default().fg(Color::Yellow)),
-            Span::raw(format_size(progress.total_size, BINARY)),
-        ]),
-        Line::from(vec![
-            Span::styled("  Errors:      ", Style::default().fg(Color::Yellow)),
+            Span::styled(format!("  {} ", spinner), Style::default().fg(Color::Cyan)),
+            Span::styled("Files: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format_num(progress.files_count),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Dirs: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format_num(progress.dirs_count),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Errors: ", Style::default().fg(Color::Yellow)),
             Span::raw(format_num(progress.errors_count)),
+        ]),
+        Line::from(vec![
+            Span::styled("    Size: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format_size(progress.total_size, BINARY),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Time: ", Style::default().fg(Color::Yellow)),
+            Span::raw(&elapsed_str),
+            Span::styled("  Rate: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format!("{}/s", format_num(progress.entries_per_sec))),
+        ]),
+        Line::from(vec![
+            Span::styled("    Dirs queued: ", Style::default().fg(Color::Yellow)),
+            Span::raw(format_num(progress.dirs_queued as u64)),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Current: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("    Stat threads: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(thread_bar, Style::default().fg(Color::Green)),
             Span::styled(
-                truncate_path(&progress.current_path, inner.width.saturating_sub(12) as usize),
+                format!(" {}", progress.stat_threads),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("    Scanning: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                truncate_path(&progress.current_path, inner.width.saturating_sub(16) as usize),
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
@@ -75,6 +109,21 @@ fn render_scanning(frame: &mut Frame, app: &App) {
 
     let paragraph = Paragraph::new(text);
     frame.render_widget(paragraph, inner);
+}
+
+fn format_elapsed(secs: f64) -> String {
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else {
+        let m = secs as u64 / 60;
+        let s = secs as u64 % 60;
+        format!("{}m{:02}s", m, s)
+    }
+}
+
+fn render_thread_bar(threads: usize, max_width: usize) -> String {
+    let bar_width = threads.min(max_width);
+    "▮".repeat(bar_width)
 }
 
 fn render_browser(frame: &mut Frame, app: &mut App) {
@@ -152,11 +201,22 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(sort_indicator.to_string()),
     ];
     if app.scanning {
+        let p = &app.scan_progress;
+        let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let idx = (p.elapsed_secs * 10.0) as usize % spinner_chars.len();
         spans.push(Span::styled(
-            "  [scanning...]",
+            format!("  {} scanning ", spinner_chars[idx]),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("{}/s ", format_num(p.entries_per_sec)),
+            Style::default().fg(Color::Green),
+        ));
+        spans.push(Span::styled(
+            format!("{}t ", p.stat_threads),
+            Style::default().fg(Color::DarkGray),
         ));
     }
     let info = Line::from(spans);
