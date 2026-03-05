@@ -1,9 +1,8 @@
 use crate::tree::{FileNode, FileTree};
-use jwalk::WalkDir;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -22,11 +21,16 @@ pub struct ScanOptions {
 }
 
 /// Number of entries to collect before doing a parallel stat batch.
-/// Larger = more stat parallelism, smaller = more responsive progress.
 const STAT_BATCH_SIZE: usize = 8192;
 /// Number of threads for parallel stat calls.
-/// More threads help on high-performance network filesystems like WekaFS.
 const STAT_THREADS: usize = 128;
+/// How often to send progress updates (in entries from readdir).
+const PROGRESS_INTERVAL: u64 = 2000;
+/// Max file children per directory in progress snapshots (dirs always included).
+/// Keeps snapshot size bounded for directories with millions of files.
+const MAX_SNAPSHOT_FILES_PER_DIR: usize = 500;
+/// Minimum interval between full tree snapshots.
+const SNAPSHOT_INTERVAL_MS: u128 = 500;
 
 pub fn start_scan(
     options: ScanOptions,
@@ -37,7 +41,7 @@ pub fn start_scan(
     })
 }
 
-/// Entry collected from jwalk (readdir only, no stat yet).
+/// Entry collected from readdir (no stat yet).
 struct PendingEntry {
     path: PathBuf,
     parent: PathBuf,
@@ -78,12 +82,11 @@ fn scan_directory(options: &ScanOptions, tx: &mpsc::UnboundedSender<ScanMessage>
     let mut files_count: u64 = 0;
     let mut dirs_count: u64 = 0;
     let mut errors_count: u64 = 0;
-    let mut entry_count: u64 = 0;
 
     let mut dir_children: HashMap<PathBuf, Vec<FileNode>> = HashMap::new();
     let mut dir_mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::new();
-    // Incremental size tracking per top-level directory (avoids O(n²) recomputation)
-    let mut top_level_sizes: HashMap<String, u64> = HashMap::new();
+    // Cumulative size for every directory (propagated from stat'd files)
+    let mut dir_sizes: HashMap<PathBuf, u64> = HashMap::new();
 
     let root_mtime = std::fs::metadata(&root_path)
         .ok()
@@ -91,90 +94,133 @@ fn scan_directory(options: &ScanOptions, tx: &mpsc::UnboundedSender<ScanMessage>
     dir_children.insert(root_path.clone(), Vec::new());
     dir_mtimes.insert(root_path.clone(), root_mtime);
 
-    // Build a dedicated thread pool for stat calls. On network filesystems,
-    // too many concurrent stat calls cause contention — 32 threads is a
-    // good balance between parallelism and network friendliness.
     let stat_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(STAT_THREADS)
         .build()
         .unwrap();
 
-    // Use regular WalkDir (no process_read_dir) so entries stream immediately
-    // after readdir completes. This gives responsive progress updates even
-    // for directories with millions of files.
-    let walker = WalkDir::new(&root_path)
-        .skip_hidden(false)
-        .follow_links(false);
+    // BFS queue — use streaming read_dir instead of jwalk so entries flow
+    // immediately from the OS rather than being buffered per-directory.
+    let mut dirs_to_scan: VecDeque<PathBuf> = VecDeque::new();
+    dirs_to_scan.push_back(root_path.clone());
 
     let mut pending: Vec<PendingEntry> = Vec::with_capacity(STAT_BATCH_SIZE);
     let mut current_path_str = String::new();
+    let mut last_progress_count: u64 = 0;
+    let mut last_snapshot_time = Instant::now();
 
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
+    while let Some(dir_path) = dirs_to_scan.pop_front() {
+        // Same-filesystem check: stat the directory before reading it
+        #[cfg(unix)]
+        if let Some(rd) = root_dev {
+            use std::os::unix::fs::MetadataExt;
+            match std::fs::metadata(&dir_path) {
+                Ok(m) if m.dev() != rd => continue,
+                Err(_) => {
+                    errors_count += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Ensure this directory has storage for its children
+        dir_children.entry(dir_path.clone()).or_default();
+
+        let read_dir = match std::fs::read_dir(&dir_path) {
+            Ok(rd) => rd,
             Err(_) => {
                 errors_count += 1;
                 continue;
             }
         };
 
-        let path = entry.path();
-        if path == root_path {
-            continue;
-        }
+        for entry_result in read_dir {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(_) => {
+                    errors_count += 1;
+                    continue;
+                }
+            };
 
-        let is_dir = entry.file_type().is_dir();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => {
+                    errors_count += 1;
+                    continue;
+                }
+            };
 
-        let parent = match path.parent() {
-            Some(p) => p.to_path_buf(),
-            None => continue,
-        };
+            // Skip symlinks (equivalent to follow_links(false))
+            if file_type.is_symlink() {
+                continue;
+            }
 
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = file_type.is_dir();
 
-        pending.push(PendingEntry {
-            path,
-            parent,
-            name,
-            is_dir,
-        });
+            if is_dir {
+                dirs_count += 1;
+                dirs_to_scan.push_back(path.clone());
+            } else {
+                files_count += 1;
+            }
 
-        if pending.len() >= STAT_BATCH_SIZE {
-            process_batch(
-                &stat_pool,
-                &pending,
-                &root_path,
-                #[cfg(unix)]
-                root_dev,
-                &mut dir_children,
-                &mut dir_mtimes,
-                &mut top_level_sizes,
-                &mut files_count,
-                &mut dirs_count,
-                &mut errors_count,
-                &mut entry_count,
-                &mut current_path_str,
-            );
-            pending.clear();
-
-            // Send progress after each batch
-            let snapshot = build_snapshot(
-                &root_path,
-                &dir_children,
-                &dir_mtimes,
-                &top_level_sizes,
-                files_count,
-                dirs_count,
-                errors_count,
-            );
-            let _ = tx.send(ScanMessage::Progress {
-                tree: snapshot,
-                current_path: current_path_str.clone(),
+            pending.push(PendingEntry {
+                path,
+                parent: dir_path.clone(),
+                name,
+                is_dir,
             });
+
+            if (files_count + dirs_count) % 500 == 0 {
+                current_path_str = pending
+                    .last()
+                    .map(|e| e.path.to_string_lossy().to_string())
+                    .unwrap_or_default();
+            }
+
+            // Stat batch when full
+            if pending.len() >= STAT_BATCH_SIZE {
+                process_batch(
+                    &stat_pool,
+                    &pending,
+                    &root_path,
+                    #[cfg(unix)]
+                    root_dev,
+                    &mut dir_children,
+                    &mut dir_mtimes,
+                    &mut dir_sizes,
+                    &mut errors_count,
+                );
+                pending.clear();
+            }
+
+            // Send progress frequently based on readdir entry count
+            if (files_count + dirs_count) - last_progress_count >= PROGRESS_INTERVAL {
+                last_progress_count = files_count + dirs_count;
+
+                // Rate-limit full tree snapshots to avoid excessive work
+                let now = Instant::now();
+                if now.duration_since(last_snapshot_time).as_millis() >= SNAPSHOT_INTERVAL_MS {
+                    last_snapshot_time = now;
+                    let snapshot = build_snapshot(
+                        &root_path,
+                        &dir_children,
+                        &dir_mtimes,
+                        &dir_sizes,
+                        files_count,
+                        dirs_count,
+                        errors_count,
+                    );
+                    let _ = tx.send(ScanMessage::Progress {
+                        tree: snapshot,
+                        current_path: current_path_str.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -188,12 +234,8 @@ fn scan_directory(options: &ScanOptions, tx: &mpsc::UnboundedSender<ScanMessage>
             root_dev,
             &mut dir_children,
             &mut dir_mtimes,
-            &mut top_level_sizes,
-            &mut files_count,
-            &mut dirs_count,
+            &mut dir_sizes,
             &mut errors_count,
-            &mut entry_count,
-            &mut current_path_str,
         );
     }
 
@@ -222,12 +264,8 @@ fn process_batch(
     #[cfg(unix)] root_dev: Option<u64>,
     dir_children: &mut HashMap<PathBuf, Vec<FileNode>>,
     dir_mtimes: &mut HashMap<PathBuf, Option<SystemTime>>,
-    top_level_sizes: &mut HashMap<String, u64>,
-    files_count: &mut u64,
-    dirs_count: &mut u64,
+    dir_sizes: &mut HashMap<PathBuf, u64>,
     errors_count: &mut u64,
-    entry_count: &mut u64,
-    current_path_str: &mut String,
 ) {
     // Parallel stat calls using dedicated thread pool
     let stat_results: Vec<Option<StatResult>> = pool.install(|| {
@@ -263,116 +301,47 @@ fn process_batch(
         };
 
         if entry.is_dir {
-            *dirs_count += 1;
-            dir_children.insert(entry.path.clone(), Vec::new());
+            dir_children.entry(entry.path.clone()).or_default();
             dir_mtimes.insert(entry.path.clone(), mtime);
             dir_children
                 .entry(entry.parent.clone())
                 .or_default()
                 .push(FileNode::new_dir(entry.name.clone(), mtime));
         } else {
-            *files_count += 1;
             dir_children
                 .entry(entry.parent.clone())
                 .or_default()
                 .push(FileNode::new_file(entry.name.clone(), size, mtime));
 
-            if let Some(top_name) = get_top_level_name(&entry.path, root_path) {
-                *top_level_sizes.entry(top_name).or_insert(0) += size;
+            // Propagate file size to all ancestor directories
+            let mut ancestor = entry.parent.clone();
+            loop {
+                *dir_sizes.entry(ancestor.clone()).or_insert(0) += size;
+                if ancestor == *root_path {
+                    break;
+                }
+                match ancestor.parent() {
+                    Some(p) => ancestor = p.to_path_buf(),
+                    None => break,
+                }
             }
-        }
-
-        *entry_count += 1;
-        if *entry_count % 500 == 0 {
-            *current_path_str = entry.path.to_string_lossy().to_string();
         }
     }
 }
 
-/// Get the name of the top-level directory that a path falls under.
-fn get_top_level_name(path: &Path, root_path: &Path) -> Option<String> {
-    let relative = path.strip_prefix(root_path).ok()?;
-    let first = relative.components().next()?;
-    Some(first.as_os_str().to_string_lossy().to_string())
-}
-
-/// Build a quick snapshot of top-level entries for incremental display.
-/// Uses pre-computed top_level_sizes for O(1) lookups.
+/// Build a recursive tree snapshot from the current scan state.
+/// Includes all directories (for navigation) but caps file children
+/// per directory to keep the snapshot size bounded.
 fn build_snapshot(
     root_path: &Path,
     dir_children: &HashMap<PathBuf, Vec<FileNode>>,
     dir_mtimes: &HashMap<PathBuf, Option<SystemTime>>,
-    top_level_sizes: &HashMap<String, u64>,
+    dir_sizes: &HashMap<PathBuf, u64>,
     total_files: u64,
     total_dirs: u64,
     total_errors: u64,
 ) -> FileTree {
-    let root_entries = match dir_children.get(root_path) {
-        Some(entries) => entries,
-        None => {
-            return FileTree {
-                root_path: root_path.to_path_buf(),
-                root: FileNode::new_dir(
-                    root_path
-                        .file_name()
-                        .unwrap_or(root_path.as_os_str())
-                        .to_string_lossy()
-                        .to_string(),
-                    dir_mtimes.get(root_path).copied().flatten(),
-                ),
-                total_files,
-                total_dirs,
-                total_errors,
-                scan_time: SystemTime::now(),
-                complete: false,
-            };
-        }
-    };
-
-    let mut children: Vec<FileNode> = root_entries
-        .iter()
-        .map(|entry| {
-            if entry.is_dir {
-                let size = top_level_sizes.get(&entry.name).copied().unwrap_or(0);
-                let child_path = root_path.join(&entry.name);
-                let child_count = dir_children
-                    .get(&child_path)
-                    .map(|c| c.len())
-                    .unwrap_or(0);
-                FileNode {
-                    name: entry.name.clone(),
-                    size,
-                    is_dir: true,
-                    child_count,
-                    mtime: entry.mtime,
-                    children: Vec::new(),
-                    error_count: 0,
-                }
-            } else {
-                entry.clone()
-            }
-        })
-        .collect();
-
-    children.sort_by(|a, b| b.size.cmp(&a.size));
-
-    let total_size: u64 = children.iter().map(|c| c.size).sum();
-    let child_count = children.len();
-    let root_name = root_path
-        .file_name()
-        .unwrap_or(root_path.as_os_str())
-        .to_string_lossy()
-        .to_string();
-
-    let root = FileNode {
-        name: root_name,
-        size: total_size,
-        is_dir: true,
-        child_count,
-        mtime: dir_mtimes.get(root_path).copied().flatten(),
-        children,
-        error_count: 0,
-    };
+    let root = build_snapshot_node(root_path, dir_children, dir_mtimes, dir_sizes);
 
     FileTree {
         root_path: root_path.to_path_buf(),
@@ -382,6 +351,57 @@ fn build_snapshot(
         total_errors,
         scan_time: SystemTime::now(),
         complete: false,
+    }
+}
+
+/// Recursively build a FileNode from the dir_children HashMap.
+/// Always includes subdirectories (for deep navigation), but limits
+/// file children to MAX_SNAPSHOT_FILES_PER_DIR per directory.
+fn build_snapshot_node(
+    path: &Path,
+    dir_children: &HashMap<PathBuf, Vec<FileNode>>,
+    dir_mtimes: &HashMap<PathBuf, Option<SystemTime>>,
+    dir_sizes: &HashMap<PathBuf, u64>,
+) -> FileNode {
+    let entries = dir_children.get(path);
+    let mtime = dir_mtimes.get(path).copied().flatten();
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .to_string();
+
+    let total_child_count = entries.map(|e| e.len()).unwrap_or(0);
+    let total_size = dir_sizes.get(path).copied().unwrap_or(0);
+
+    let mut children = Vec::new();
+
+    if let Some(entries) = entries {
+        let mut file_count = 0;
+        for entry in entries {
+            if entry.is_dir {
+                // Always recurse into subdirectories
+                let child_path = path.join(&entry.name);
+                let child =
+                    build_snapshot_node(&child_path, dir_children, dir_mtimes, dir_sizes);
+                children.push(child);
+            } else if file_count < MAX_SNAPSHOT_FILES_PER_DIR {
+                children.push(entry.clone());
+                file_count += 1;
+            }
+        }
+    }
+
+    children.sort_by(|a, b| b.size.cmp(&a.size));
+
+    FileNode {
+        name,
+        size: total_size,
+        is_dir: true,
+        child_count: total_child_count,
+        mtime,
+        children,
+        error_count: 0,
     }
 }
 

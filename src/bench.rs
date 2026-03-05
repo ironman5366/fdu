@@ -1,4 +1,3 @@
-/// Headless benchmark binary — runs the scanner without TUI
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -6,9 +5,6 @@ mod cache;
 mod cli;
 mod scanner;
 mod tree;
-
-// Reuse app/events/ui modules aren't needed for benchmark
-// We only need scanner + tree
 
 #[tokio::main]
 async fn main() {
@@ -31,7 +27,7 @@ async fn main() {
     loop {
         match rx.recv().await {
             Some(scanner::ScanMessage::Progress { tree, current_path }) => {
-                if last_progress.elapsed().as_millis() > 500 {
+                if last_progress.elapsed().as_millis() > 200 {
                     eprintln!(
                         "[{:.1}s] {} files, {} dirs, {} errors | {}",
                         start.elapsed().as_secs_f64(),

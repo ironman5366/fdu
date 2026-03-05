@@ -195,16 +195,24 @@ impl App {
                     errors_count: tree.total_errors,
                     current_path,
                 };
-                // Keep selection stable: clamp to new child count
-                let new_count = tree.root.children.len();
                 self.tree = Some(tree);
                 if self.view == View::Scanning {
                     self.view = View::Browser;
                 }
-                // Only clamp if user is at root level viewing top-level entries
-                if self.breadcrumbs.is_empty() && self.selected_index >= new_count && new_count > 0
-                {
-                    self.selected_index = new_count - 1;
+                // Validate breadcrumbs — if the tree changed and our navigation
+                // path is no longer valid, pop back to the deepest valid level
+                while !self.breadcrumbs.is_empty() {
+                    if self.tree.as_ref().and_then(|t| t.node_at(&self.breadcrumbs)).is_none() {
+                        self.breadcrumbs.pop();
+                        self.selected_index = 0;
+                    } else {
+                        break;
+                    }
+                }
+                // Clamp selected index to valid range
+                let count = self.child_count();
+                if count > 0 && self.selected_index >= count {
+                    self.selected_index = count - 1;
                 }
             }
             ScanMessage::Complete(tree) => {
