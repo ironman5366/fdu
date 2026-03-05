@@ -50,21 +50,31 @@ impl FileNode {
     }
 
     pub fn sort_by_size_desc(&mut self) {
-        self.children.sort_by(|a, b| b.size.cmp(&a.size));
+        self.children.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| b.size.cmp(&a.size))
+        });
     }
 
     pub fn sort_by_size_asc(&mut self) {
-        self.children.sort_by(|a, b| a.size.cmp(&b.size));
+        self.children.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| a.size.cmp(&b.size))
+        });
     }
 
     pub fn sort_by_name_asc(&mut self) {
-        self.children
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        self.children.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
     }
 
     pub fn sort_by_name_desc(&mut self) {
-        self.children
-            .sort_by(|a, b| b.name.to_lowercase().cmp(&a.name.to_lowercase()));
+        self.children.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| b.name.to_lowercase().cmp(&a.name.to_lowercase()))
+        });
     }
 
     pub fn sort_recursive_by_size(&mut self) {

@@ -1,6 +1,7 @@
 use crate::app::{App, SortOrder, View};
 use crate::tree::FileNode;
 use humansize::{format_size, BINARY};
+use std::collections::HashMap;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -152,7 +153,7 @@ fn render_browser(frame: &mut Frame, app: &mut App) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // header
+                Constraint::Length(4), // header
                 Constraint::Min(1),   // list
                 Constraint::Length(1), // footer
             ])
@@ -211,7 +212,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let mut spans = vec![
+    let mut line1_spans = vec![
         Span::styled("  Total: ", Style::default().fg(Color::Yellow)),
         Span::styled(&size, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Span::styled("  Files: ", Style::default().fg(Color::Yellow)),
@@ -225,24 +226,79 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         let p = &app.scan_progress;
         let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
         let idx = (p.elapsed_secs * 10.0) as usize % spinner_chars.len();
-        spans.push(Span::styled(
+        line1_spans.push(Span::styled(
             format!("  {} scanning ", spinner_chars[idx]),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled(
+        line1_spans.push(Span::styled(
             format!("{}/s ", format_num(p.entries_per_sec)),
             Style::default().fg(Color::Green),
         ));
-        spans.push(Span::styled(
+        line1_spans.push(Span::styled(
             format!("{}t ", p.stat_threads),
             Style::default().fg(Color::DarkGray),
         ));
     }
-    let info = Line::from(spans);
 
-    frame.render_widget(Paragraph::new(info), inner);
+    // Line 2: extension statistics for current directory
+    let ext_stats = build_extension_stats(node);
+    let mut line2_spans = vec![Span::styled("  ", Style::default())];
+    if !ext_stats.is_empty() {
+        for (i, (ext, count, ext_size)) in ext_stats.iter().take(6).enumerate() {
+            if i > 0 {
+                line2_spans.push(Span::styled("  ", Style::default()));
+            }
+            line2_spans.push(Span::styled(
+                ext.clone(),
+                Style::default().fg(Color::Cyan),
+            ));
+            line2_spans.push(Span::styled(
+                format!(": {}×{}", format_num(*count as u64), format_size(*ext_size, BINARY)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        if ext_stats.len() > 6 {
+            line2_spans.push(Span::styled(
+                format!("  +{} more", ext_stats.len() - 6),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    let text = vec![Line::from(line1_spans), Line::from(line2_spans)];
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// Compute extension statistics from a directory's children.
+/// Returns vec of (extension, count, total_size) sorted by total size descending.
+fn build_extension_stats(node: Option<&FileNode>) -> Vec<(String, usize, u64)> {
+    let node = match node {
+        Some(n) if n.is_dir => n,
+        _ => return Vec::new(),
+    };
+
+    let mut ext_map: HashMap<String, (usize, u64)> = HashMap::new();
+    for child in &node.children {
+        if child.is_dir {
+            continue;
+        }
+        let ext = child
+            .name
+            .rsplit('.')
+            .next()
+            .filter(|e| e.len() < 10 && child.name.contains('.'))
+            .map(|e| format!(".{}", e.to_lowercase()))
+            .unwrap_or_else(|| "(no ext)".to_string());
+        let entry = ext_map.entry(ext).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += child.size;
+    }
+
+    let mut stats: Vec<_> = ext_map.into_iter().map(|(k, (c, s))| (k, c, s)).collect();
+    stats.sort_by(|a, b| b.2.cmp(&a.2));
+    stats
 }
 
 fn render_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -254,13 +310,14 @@ fn render_list(frame: &mut Frame, app: &App, area: Rect) {
     let parent_size = node.size;
     let visible_height = area.height as usize;
 
+    let scanning = app.scanning;
     let items: Vec<ListItem> = node
         .children
         .iter()
         .enumerate()
         .skip(app.scroll_offset)
         .take(visible_height)
-        .map(|(i, child)| render_entry(child, parent_size, app.show_bars, i == app.selected_index))
+        .map(|(i, child)| render_entry(child, parent_size, app.show_bars, i == app.selected_index, scanning))
         .collect();
 
     let list = List::new(items);
@@ -272,8 +329,15 @@ fn render_entry(
     parent_size: u64,
     show_bars: bool,
     is_selected: bool,
+    scanning: bool,
 ) -> ListItem<'static> {
-    let size_str = format!("{:>10}", format_size(node.size, BINARY));
+    // Directory with no size and no children yet = hasn't been crawled
+    let is_pending = scanning && node.is_dir && node.size == 0 && node.child_count == 0;
+    let size_str = if is_pending {
+        format!("{:>10}", "pending")
+    } else {
+        format!("{:>10}", format_size(node.size, BINARY))
+    };
     let name = if node.is_dir {
         format!("{}/", node.name)
     } else {
@@ -314,15 +378,21 @@ fn render_entry(
         Style::default().fg(Color::Green)
     };
 
+    let size_style = if is_pending {
+        base_style.fg(Color::DarkGray)
+    } else {
+        base_style
+    };
+
     let spans = if show_bars {
         vec![
-            Span::styled(format!("  {} ", size_str), base_style),
+            Span::styled(format!("  {} ", size_str), size_style),
             Span::styled(format!("{} ", bar), bar_style),
             Span::styled(name, name_style),
         ]
     } else {
         vec![
-            Span::styled(format!("  {} ", size_str), base_style),
+            Span::styled(format!("  {} ", size_str), size_style),
             Span::styled(name, name_style),
         ]
     };
@@ -415,8 +485,23 @@ fn render_thread_panel(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let count = app.child_count();
-    let pos = if count > 0 {
-        format!("{}/{}", app.selected_index + 1, count)
+    let node = app.current_node();
+    let is_aggregated = node.map(|n| n.child_count > n.children.len()).unwrap_or(false);
+
+    let pos = if app.expanding {
+        "expanding...".to_string()
+    } else if count > 0 {
+        if is_aggregated {
+            let total = node.unwrap().child_count;
+            format!(
+                "{}/{} (of {} total)",
+                app.selected_index + 1,
+                count,
+                format_num(total as u64),
+            )
+        } else {
+            format!("{}/{}", app.selected_index + 1, count)
+        }
     } else {
         "empty".to_string()
     };
@@ -425,6 +510,12 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         " ↑↓/jk:nav  →/enter:open  ←/bs:back  s:sort  g:bars  d:del  ?:help  q:quit ",
         Style::default().fg(Color::DarkGray),
     )];
+    if is_aggregated && !app.expanding {
+        spans.push(Span::styled(
+            " e:expand ",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     if app.scanning {
         spans.push(Span::styled(
             " space:threads ",

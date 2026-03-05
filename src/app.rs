@@ -1,5 +1,6 @@
 use crate::scanner::{ScanMessage, ThreadActivities};
 use crate::tree::{FileNode, FileTree};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum View {
@@ -44,6 +45,7 @@ pub struct App {
     pub error_message: Option<String>,
     pub show_threads: bool,
     pub thread_activities: Option<ThreadActivities>,
+    pub expanding: bool,
 }
 
 impl App {
@@ -62,6 +64,7 @@ impl App {
             error_message: None,
             show_threads: false,
             thread_activities: None,
+            expanding: false,
         }
     }
 
@@ -244,11 +247,53 @@ impl App {
                     self.selected_index = count - 1;
                 }
             }
+            ScanMessage::ExpandResult {
+                breadcrumbs,
+                children,
+            } => {
+                self.expanding = false;
+                // Apply expand result if navigation path is still valid
+                if let Some(tree) = self.tree.as_mut() {
+                    let node = if breadcrumbs.is_empty() {
+                        Some(&mut tree.root)
+                    } else {
+                        tree.node_at_mut(&breadcrumbs)
+                    };
+                    if let Some(node) = node {
+                        node.child_count = children.len();
+                        node.children = children;
+                    }
+                }
+                let count = self.child_count();
+                if count > 0 && self.selected_index >= count {
+                    self.selected_index = count - 1;
+                }
+            }
             ScanMessage::Error(msg) => {
                 self.error_message = Some(msg);
                 self.should_quit = true;
             }
         }
+    }
+
+    /// Returns true if the current directory has aggregated (hidden) children.
+    pub fn is_aggregated(&self) -> bool {
+        self.current_node()
+            .map(|n| n.child_count > n.children.len())
+            .unwrap_or(false)
+    }
+
+    /// Get the filesystem path of the currently viewed directory.
+    pub fn current_dir_path(&self) -> Option<PathBuf> {
+        let tree = self.tree.as_ref()?;
+        let mut path = tree.root_path.clone();
+        let mut current = &tree.root;
+        for &idx in &self.breadcrumbs {
+            let child = current.children.get(idx)?;
+            path = path.join(&child.name);
+            current = child;
+        }
+        Some(path)
     }
 
     fn ensure_visible(&mut self) {

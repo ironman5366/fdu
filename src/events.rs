@@ -51,7 +51,25 @@ impl EventHandler {
                     }
                     maybe_scan = scan_rx.recv() => {
                         if let Some(msg) = maybe_scan {
-                            if tx.send(AppEvent::Scan(msg)).is_err() {
+                            // Coalesce: drain any queued scan messages and keep
+                            // only the latest Progress (avoids UI processing a
+                            // backlog of expensive tree replacements).
+                            let mut latest = msg;
+                            while let Ok(next) = scan_rx.try_recv() {
+                                match (&latest, &next) {
+                                    // Replace Progress with newer Progress
+                                    (ScanMessage::Progress { .. }, ScanMessage::Progress { .. }) => {
+                                        latest = next;
+                                    }
+                                    // Non-Progress messages (Complete, Error, ExpandResult)
+                                    // must be delivered — send the current one, keep the new
+                                    _ => {
+                                        let _ = tx.send(AppEvent::Scan(latest));
+                                        latest = next;
+                                    }
+                                }
+                            }
+                            if tx.send(AppEvent::Scan(latest)).is_err() {
                                 break;
                             }
                         }

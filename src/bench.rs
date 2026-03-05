@@ -62,6 +62,7 @@ async fn main() {
                 );
                 break;
             }
+            Some(scanner::ScanMessage::ExpandResult { .. }) => {}
             Some(scanner::ScanMessage::Error(e)) => {
                 eprintln!("Error: {}", e);
                 break;

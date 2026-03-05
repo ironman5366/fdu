@@ -16,6 +16,12 @@ use scanner::{ScanOptions, new_thread_activities, start_scan};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+/// State needed for expand operations (persists after scan completes)
+struct ExpandState {
+    tx: mpsc::UnboundedSender<scanner::ScanMessage>,
+    stat_threads: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -30,14 +36,19 @@ async fn main() -> Result<()> {
     };
 
     let (scan_tx, scan_rx) = mpsc::unbounded_channel();
+    let stat_threads = cli.threads.unwrap_or(128);
+    let expand_state = ExpandState {
+        tx: scan_tx.clone(),
+        stat_threads,
+    };
 
     if let Some(tree) = cached_tree {
         // Use cached tree, skip scanning
         app.tree = Some(tree);
         app.view = app::View::Browser;
+        app.scanning = false;
     } else {
         // Start background scan
-        let stat_threads = cli.threads.unwrap_or(128);
         let thread_activities = new_thread_activities(stat_threads);
         app.thread_activities = Some(thread_activities.clone());
         let scan_options = ScanOptions {
@@ -61,7 +72,7 @@ async fn main() -> Result<()> {
 
         if let Some(event) = events.next().await {
             match event {
-                AppEvent::Key(key) => handle_key(&mut app, key),
+                AppEvent::Key(key) => handle_key(&mut app, key, &expand_state),
                 AppEvent::Scan(msg) => app.handle_scan_message(msg),
                 AppEvent::Resize => {} // ratatui handles resize on next draw
                 AppEvent::Tick => {}         // just triggers a redraw
@@ -104,7 +115,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) {
+fn handle_key(app: &mut App, key: KeyEvent, expand_state: &ExpandState) {
     // Ctrl+C always quits
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         app.should_quit = true;
@@ -133,6 +144,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             KeyCode::Char(' ') => {
                 if app.scanning {
                     app.show_threads = !app.show_threads;
+                }
+            }
+            KeyCode::Char('e') => {
+                if app.is_aggregated() && !app.expanding {
+                    if let Some(dir_path) = app.current_dir_path() {
+                        app.expanding = true;
+                        let breadcrumbs = app.breadcrumbs.clone();
+                        let tx = expand_state.tx.clone();
+                        let threads = expand_state.stat_threads;
+                        tokio::task::spawn_blocking(move || {
+                            let children = scanner::expand_directory(&dir_path, threads);
+                            let _ = tx.send(scanner::ScanMessage::ExpandResult {
+                                breadcrumbs,
+                                children,
+                            });
+                        });
+                    }
                 }
             }
             KeyCode::Char('?') => app.view = app::View::Help,
